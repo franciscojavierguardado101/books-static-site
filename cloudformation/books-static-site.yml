@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Books Static Site - CloudFormation equivalent of the Terraform configuration.
+  Provisions S3 + CloudFront + IAM + CloudWatch for the Books Next.js static export.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Deployment environment
+
+Resources:
+
+  # S3 bucket — stores the Books static site files
+  BooksSiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "francisco-guardado-books-${Environment}-site"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: books-static-site
+
+  # Origin Access Control — lets CloudFront read the private bucket
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${Environment}-books-site-oac"
+        Description: !Sub "OAC for ${Environment} Books static site"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # CloudFront distribution — global CDN with HTTPS
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Comment: !Sub "${Environment} Books static site"
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: !Sub "S3-${BooksSiteBucket}"
+            DomainName: !GetAtt BooksSiteBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub "S3-${BooksSiteBucket}"
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /404/index.html
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: books-static-site
+
+  # Bucket policy — grants CloudFront OAC read access
+  BooksSiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BooksSiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${BooksSiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  # IAM deployer user — least privilege for the deploy workflow
+  DeployerUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${Environment}-books-site-deployer"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: books-static-site
+
+  DeployerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${Environment}-books-site-deployer-policy"
+      Users:
+        - !Ref DeployerUser
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt BooksSiteBucket.Arn
+              - !Sub "${BooksSiteBucket.Arn}/*"
+          - Effect: Allow
+            Action:
+              - cloudfront:CreateInvalidation
+            Resource: "*"
+
+  # CloudWatch alarm — 4xx error rate (client errors)
+  Alarm4xxErrorRate:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-books-site-4xx-error-rate"
+      AlarmDescription: Books site CloudFront 4xx error rate exceeded 5%
+      Namespace: AWS/CloudFront
+      MetricName: 4xxErrorRate
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+        - Name: Region
+          Value: Global
+
+  # CloudWatch alarm — 5xx error rate (origin errors)
+  Alarm5xxErrorRate:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-books-site-5xx-error-rate"
+      AlarmDescription: Books site CloudFront 5xx error rate exceeded 1%
+      Namespace: AWS/CloudFront
+      MetricName: 5xxErrorRate
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+        - Name: Region
+          Value: Global
+
+Outputs:
+  CloudFrontURL:
+    Description: URL to access the Books site via CloudFront
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+
+  S3BucketName:
+    Description: S3 bucket storing the static site files
+    Value: !Ref BooksSiteBucket
+
+  DistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution

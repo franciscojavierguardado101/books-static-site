@@ -1,0 +1,103 @@
+name: Deploy Books Site to S3
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deploy-site.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    name: Build Next.js Static Export and Sync to S3
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Books frontend
+        uses: actions/checkout@v4
+        with:
+          repository: franciscojavierguardado101/franciscojavierguardado101-book-1-frontend
+          token: ${{ secrets.BOOKS_FRONTEND_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Override next.config.ts for static export — API routes are excluded
+      # The original config uses output: standalone for Docker/K8s; we need output: export for S3
+      - name: Configure for static export
+        run: |
+          cat > next.config.ts << 'EOF'
+          import type { NextConfig } from "next";
+
+          const nextConfig: NextConfig = {
+            output: "export",
+            trailingSlash: true,
+            images: {
+              unoptimized: true,
+              remotePatterns: [
+                {
+                  protocol: "https",
+                  hostname: "dev-francisco-guardado-book-1.pantheonsite.io",
+                  pathname: "/sites/default/files/**",
+                },
+              ],
+            },
+            async redirects() {
+              return [
+                {
+                  source: "/node/:nid",
+                  destination: "/articles/:nid",
+                  permanent: false,
+                },
+              ];
+            },
+          };
+
+          export default nextConfig;
+          EOF
+
+      # Remove API routes — not compatible with next export (they require a Node.js server)
+      - name: Remove server-only API routes
+        run: rm -rf src/app/api/
+
+      - name: Build static export
+        run: npm run build
+        env:
+          DRUPAL_BASE_URL: https://dev-francisco-guardado-book-1.pantheonsite.io
+          NEXT_PUBLIC_DRUPAL_BASE_URL: https://dev-francisco-guardado-book-1.pantheonsite.io
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync static files to S3
+        run: |
+          aws s3 sync out/ s3://francisco-guardado-books-dev-site \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "*.html"
+          aws s3 sync out/ s3://francisco-guardado-books-dev-site \
+            --delete \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --include "*.html"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          DISTRIBUTION_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Comment=='dev Books static site'].Id" \
+            --output text)
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/*"
