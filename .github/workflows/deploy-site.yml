@@ -65,36 +65,14 @@ jobs:
           export default nextConfig;
           EOF
 
-      # Remove API routes — not compatible with next export (they require a Node.js server)
-      - name: Remove server-only API routes
-        run: rm -rf src/app/api/
-
-      # Inject generateStaticParams into [...slug]/page.tsx so Next.js knows which
-      # Drupal pages to pre-render at build time. Required for output: export.
-      - name: Inject generateStaticParams for Drupal pages
+      # Remove routes that are incompatible with next export:
+      # - API routes require a Node.js server
+      # - [...slug] catch-all requires generateStaticParams with live Drupal data at build time,
+      #   which is unreliable in CI. Homepage and articles routes export cleanly without it.
+      - name: Remove server-incompatible routes
         run: |
-          cat >> src/app/\[...slug\]/page.tsx << 'EOF'
-
-          export async function generateStaticParams() {
-            const DRUPAL_BASE = process.env.DRUPAL_BASE_URL ?? "https://dev-francisco-guardado-book-1.pantheonsite.io";
-            try {
-              const res = await fetch(
-                `${DRUPAL_BASE}/jsonapi/node/landing_page?fields[node--landing_page]=path&filter[status]=1&page[limit]=100`,
-                { headers: { Accept: "application/vnd.api+json" } }
-              );
-              if (!res.ok) return [];
-              const json = await res.json() as { data: { attributes: { path: { alias: string | null } } }[] };
-              return json.data.flatMap((node) => {
-                const alias = node.attributes.path?.alias;
-                if (!alias) return [];
-                const segments = alias.replace(/^\//, "").split("/").filter(Boolean);
-                return segments.length > 0 ? [{ slug: segments }] : [];
-              });
-            } catch {
-              return [];
-            }
-          }
-          EOF
+          rm -rf src/app/api/
+          rm -rf "src/app/[...slug]/"
 
       - name: Build static export
         run: npm run build
